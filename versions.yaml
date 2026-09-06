@@ -1,0 +1,32 @@
+# Every input to the pi5 installer image, in one place.
+#
+# This is the single-source rule that SQU-96 established for the Talos
+# version, applied to the whole image: a version written in two places
+# drifts, and the drift is silent until a node will not upgrade.
+#
+# talos MUST equal `talosVersion` in opwerm/nexus talos/talconfig.yaml.
+# hack/check-talos-pins.sh in that repo asserts the tag this build produces
+# matches it, so a bump here without a bump there fails `just check`.
+
+# Talos release. Sets the imager tag and the installer base.
+talos: v1.14.0
+
+# Raspberry Pi overlay. Supplies the rpi_5 board artifacts -- including a
+# u-boot binary we then replace, see below.
+overlay: ghcr.io/siderolabs/sbc-raspberrypi:v0.2.1
+
+# Tailscale system extension. Pinned to what the RK1s already run, read off
+# hive-1 rather than taken from a tag list, so the estate is on one version.
+tailscale: ghcr.io/siderolabs/tailscale:1.102.2
+
+# Our u-boot, from excavador/u-boot-rpi5. This is the whole reason the
+# image exists: the stock rpi_5 overlay ships rpi_generic's u-boot binary
+# (sbc-raspberrypi#96), which does not boot D0 silicon and does not
+# advertise SetVariableRT, so `talosctl upgrade` fails at the bootloader.
+uboot_repo: excavador/u-boot-rpi5
+uboot_tag: v2025.04-rpi5-3-hive.2
+
+# Where the replacement goes. The overlay really does ship the Pi 5 board's
+# u-boot under rpi_generic -- that mislabelling IS issue #96 -- so this path
+# is correct despite looking wrong.
+uboot_path: overlay/artifacts/arm64/u-boot/rpi_generic/u-boot.bin
