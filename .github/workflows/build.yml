@@ -1,8 +1,8 @@
-# Build the pi5 installer and the flashable SD image, publish both to GHCR
-# and to a GitHub Release.
+# Build the pi5 installer and the flashable SD image; publish both to GHCR
+# and to a GitHub Release only on a tag push.
 #
-# Replaces a bench registry on a workstation (192.168.1.29:5000) that was a
-# single-host SPOF for the image the sole control plane upgrades from.
+# Replaced a bench registry on a workstation that was a single-host SPOF for
+# the image the sole control plane upgrades from.
 name: build
 
 on:
@@ -11,15 +11,26 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: write
-  packages: write
-
 jobs:
+  # Builds and verifies the installer image locally, with no registry
+  # credential of any kind: pull_request and plain branch-push runs never
+  # touch GHCR. Its output is uploaded as a plain workflow artifact for
+  # `publish` to pick up.
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      talos: ${{ steps.v.outputs.talos }}
+      imager: ${{ steps.v.outputs.imager }}
+      overlay: ${{ steps.v.outputs.overlay }}
+      tailscale: ${{ steps.v.outputs.tailscale }}
+      uboot_repo: ${{ steps.v.outputs.uboot_repo }}
+      uboot_tag: ${{ steps.v.outputs.uboot_tag }}
+      uboot_path: ${{ steps.v.outputs.uboot_path }}
+      uboot_sha256: ${{ steps.uboot.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: read pinned versions
         id: v
@@ -114,7 +125,7 @@ jobs:
 
       # The overlay installer binary we run below (to populate the SD
       # image's ESP) is arm64; the runner is amd64.
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:
           platforms: arm64
 
@@ -136,8 +147,57 @@ jobs:
               --system-extension-image "${TAILSCALE}"
           ls -la out/
 
+      # The overlay genuinely ships the Pi 5 board's u-boot under
+      # rpi_generic; that mislabelling IS sbc-raspberrypi#96. Replacing this
+      # path is what makes the image boot D0 silicon. This only assembles
+      # the replacement layer locally; nothing is pushed anywhere yet.
+      - name: assemble the u-boot replacement layer
+        env:
+          UBOOT_PATH: ${{ steps.v.outputs.uboot_path }}
+        run: |
+          mkdir -p layer/"$(dirname "$UBOOT_PATH")"
+          cp uboot/u-boot.bin layer/"$UBOOT_PATH"
+          tar cf uboot-layer.tar -C layer --owner=0 --group=0 .
+
+      - name: upload build outputs for publish
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installer-build-${{ github.sha }}
+          path: |
+            out/*
+            uboot-layer.tar
+            uboot/u-boot.bin
+            uboot/SHA256SUMS
+          if-no-files-found: error
+
+  # Everything that needs a registry write or a release write lives here,
+  # and only here: this job is the sole holder of packages: write and
+  # contents: write, and it only ever runs on a tag push. A pull_request or
+  # plain branch push never reaches it, so it never sees a registry
+  # credential.
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      TALOS: ${{ needs.build.outputs.talos }}
+      IMAGER: ${{ needs.build.outputs.imager }}
+      OVERLAY: ${{ needs.build.outputs.overlay }}
+      TAILSCALE: ${{ needs.build.outputs.tailscale }}
+      UBOOT_REPO: ${{ needs.build.outputs.uboot_repo }}
+      UBOOT_TAG: ${{ needs.build.outputs.uboot_tag }}
+      UBOOT_PATH: ${{ needs.build.outputs.uboot_path }}
+      UBOOT_SHA256: ${{ needs.build.outputs.uboot_sha256 }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: installer-build-${{ github.sha }}
+
       - name: log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -145,26 +205,13 @@ jobs:
 
       - name: push base, then lay our u-boot over it
         id: push
-        env:
-          UBOOT_PATH: ${{ steps.v.outputs.uboot_path }}
         run: |
           IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/installer-rpi5"
-          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-          else
-            TAG="ci-${GITHUB_SHA::12}"
-          fi
+          TAG="${GITHUB_REF#refs/tags/}"
 
           ART="$(find out -maxdepth 1 -name 'installer-*.tar' | head -1)"
           echo "  imager artifact: $ART"
           crane push "$ART" "${IMAGE}:${TAG}-base"
-
-          # The overlay genuinely ships the Pi 5 board's u-boot under
-          # rpi_generic; that mislabelling IS sbc-raspberrypi#96. Replacing
-          # this path is what makes the image boot D0 silicon.
-          mkdir -p layer/"$(dirname "$UBOOT_PATH")"
-          cp uboot/u-boot.bin layer/"$UBOOT_PATH"
-          tar cf uboot-layer.tar -C layer --owner=0 --group=0 .
 
           crane append -b "${IMAGE}:${TAG}-base" -f uboot-layer.tar -t "${IMAGE}:${TAG}"
           digest="$(crane digest "${IMAGE}:${TAG}")"
@@ -182,7 +229,6 @@ jobs:
       - name: verify the published image really carries our u-boot
         env:
           IMAGE_BY_DIGEST: ${{ steps.push.outputs.image_by_digest }}
-          UBOOT_PATH: ${{ steps.v.outputs.uboot_path }}
         run: |
           crane export "$IMAGE_BY_DIGEST" - | tar -xO "$UBOOT_PATH" > pulled-u-boot.bin
           a="$(sha256sum uboot/u-boot.bin | awk '{print $1}')"
@@ -206,10 +252,12 @@ jobs:
       # image's ESP. That makes the SD image and the installer carry the
       # same u-boot, config.txt and DTBs by construction, and the result is
       # asserted byte-for-byte rather than assumed.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          platforms: arm64
+
       - name: build the flashable SD image
         env:
-          IMAGER: ${{ steps.v.outputs.imager }}
-          OVERLAY: ${{ steps.v.outputs.overlay }}
           IMAGE_BY_DIGEST: ${{ steps.push.outputs.image_by_digest }}
         run: |
           mkdir -p out-metal esp-stage/boot/EFI
@@ -255,14 +303,9 @@ jobs:
 
       - name: write provenance and assemble release artifacts
         env:
-          TAG: ${{ steps.v.outputs.talos }}
-          TALOS: ${{ steps.v.outputs.talos }}
           IMAGE: ${{ steps.push.outputs.image }}
           IMAGE_BY_DIGEST: ${{ steps.push.outputs.image_by_digest }}
           DIGEST: ${{ steps.push.outputs.digest }}
-          UBOOT_REPO: ${{ steps.v.outputs.uboot_repo }}
-          UBOOT_TAG: ${{ steps.v.outputs.uboot_tag }}
-          UBOOT_SHA256: ${{ steps.uboot.outputs.sha256 }}
         run: |
           mkdir -p artifacts
           cp metal-arm64.raw.zst artifacts/
@@ -285,21 +328,20 @@ jobs:
 
           ( cd artifacts && sha256sum metal-arm64.raw.zst installer.digest provenance.json > SHA256SUMS )
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pi5-installer-${{ github.sha }}
           path: artifacts/*
           if-no-files-found: error
 
       - name: release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: artifacts/*
           fail_on_unmatched_files: true
           body: |
             pi5 Talos installer and flashable SD image, with our EFI-capable
-            u-boot (`${{ steps.v.outputs.uboot_repo }}` `${{ steps.v.outputs.uboot_tag }}`)
+            u-boot (`${{ env.UBOOT_REPO }}` `${{ env.UBOOT_TAG }}`)
             laid over the `rpi_5` overlay.
 
             Consume the installer **by digest**, never `repo:tag@sha256:`:

@@ -4,9 +4,9 @@
 # version, applied to the whole image: a version written in two places
 # drifts, and the drift is silent until a node will not upgrade.
 #
-# talos MUST equal `talosVersion` in opwerm/nexus talos/talconfig.yaml.
-# hack/check-talos-pins.sh in that repo asserts the tag this build produces
-# matches it, so a bump here without a bump there fails `just check`.
+# talos MUST equal `talosVersion` in the estate's cluster config.
+# A guard there asserts the tag this build produces matches it, so a bump
+# here without a bump there fails that repo's `just check`.
 
 # Talos release. Sets the imager tag and the installer base.
 talos: v1.14.0

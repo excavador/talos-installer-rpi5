@@ -102,3 +102,10 @@ public, anonymously pullable GHCR image, so a node's own registry mirror, if
 it has one, can fall back to pulling it directly from GHCR. That dance only
 earns its keep when the only path to an installer runs through
 infrastructure that can itself be down.
+
+## Licensing
+
+The `u-boot.bin` embedded in this image — both in the installer and in the
+flashable SD image — is GPL-2.0. Its complete corresponding source is
+[`excavador/u-boot-rpi5`](https://github.com/excavador/u-boot-rpi5), at the
+tag recorded as `uboot.tag` in each release's `provenance.json`.
