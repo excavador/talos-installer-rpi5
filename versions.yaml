@@ -11,13 +11,37 @@
 # Talos release. Sets the imager tag and the installer base.
 talos: v1.14.0
 
-# Raspberry Pi overlay. Supplies the rpi_5 board artifacts -- including a
-# u-boot binary we then replace, see below.
-overlay: ghcr.io/siderolabs/sbc-raspberrypi:v0.2.1
+# The Talos imager, pinned by digest as well as tag: `just check` (below)
+# fetches ghcr.io/siderolabs/imager:v1.14.0 fresh, and a moved tag is exactly
+# the failure this pin exists to catch.
+imager: ghcr.io/siderolabs/imager:v1.14.0@sha256:b4025bdc0aa3392d56997419457d4ca0cf81016c721de36d0128f7a519d11d5f
 
-# Tailscale system extension. Pinned to what the RK1s already run, read off
-# hive-1 rather than taken from a tag list, so the estate is on one version.
-tailscale: ghcr.io/siderolabs/tailscale:1.102.2
+# Raspberry Pi overlay. Supplies the rpi_5 board artifacts -- including a
+# u-boot binary we then replace, see below. Pinned by digest, and that
+# digest is checked in CI against Talos v1.14.0's own overlays.yaml manifest
+# (below), not just trusted from the tag: a tag can be re-pointed at a build
+# made for a different Talos release.
+overlay: ghcr.io/siderolabs/sbc-raspberrypi:v0.2.1@sha256:b781717ccba0b39a2bf4a657125c3258feecc4cd76c9cea39baf2dcfb54854c7
+
+# Tailscale system extension, pinned by digest and checked the same way.
+# MEASURED 2026-09-29: the bare tag `tailscale:1.102.2` resolves to
+# sha256:a0408a4a..., which is NOT the build Talos v1.14.0 itself ships for
+# that tag (sha256:b84c796c..., below). Siderolabs rebuild extensions per
+# Talos release and re-point the tag, so "whatever the tag resolves to
+# today" silently pins an extension built for some other Talos. The digest
+# below is read from ghcr.io/siderolabs/extensions:v1.14.0's own
+# image-digests file, which is the only authority for "the tailscale that
+# belongs with v1.14.0" -- see the manifest check in .github/workflows/build.yml.
+tailscale: ghcr.io/siderolabs/tailscale:1.102.2@sha256:b84c796cc86125d2d0d09d526486bd0f1627ae39bcbfb97eb17d8b8205a5b857
+
+# Talos's own lists of which extension and overlay builds belong to this
+# release. Not consumed by the build -- consumed by the guard in
+# .github/workflows/build.yml that checks `overlay` and `tailscale` above
+# against them, so a Talos bump that forgets to re-read those pins fails
+# loudly instead of shipping a mismatched extension.
+manifests:
+  extensions: ghcr.io/siderolabs/extensions:v1.14.0@sha256:67684a0ee0fe775933e4d53697703d4ad028bb00b670205d30c9f966e70de171
+  overlays: ghcr.io/siderolabs/overlays:v1.14.0@sha256:38a3e9823defa5c0bce98bfe1be31454f632f23f73694947efd07ac4b9919a88
 
 # Our u-boot, from excavador/u-boot-rpi5. This is the whole reason the
 # image exists: the stock rpi_5 overlay ships rpi_generic's u-boot binary

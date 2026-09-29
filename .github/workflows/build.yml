@@ -1,4 +1,5 @@
-# Build the pi5 installer and publish it to GHCR.
+# Build the pi5 installer and the flashable SD image, publish both to GHCR
+# and to a GitHub Release.
 #
 # Replaces a bench registry on a workstation (192.168.1.29:5000) that was a
 # single-host SPOF for the image the sole control plane upgrades from.
@@ -11,7 +12,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -24,11 +25,17 @@ jobs:
         id: v
         run: |
           # yq ships on GitHub runners.
-          for k in talos overlay tailscale uboot_repo uboot_tag uboot_path; do
+          for k in talos imager overlay tailscale uboot_repo uboot_tag uboot_path; do
             v="$(yq -r ".${k}" versions.yaml)"
             [ -n "$v" ] && [ "$v" != "null" ] || { echo "versions.yaml: ${k} is empty" >&2; exit 1; }
             echo "${k}=${v}" >> "$GITHUB_OUTPUT"
             echo "  ${k} = ${v}"
+          done
+          for k in extensions overlays; do
+            v="$(yq -r ".manifests.${k}" versions.yaml)"
+            [ -n "$v" ] && [ "$v" != "null" ] || { echo "versions.yaml: manifests.${k} is empty" >&2; exit 1; }
+            echo "manifest_${k}=${v}" >> "$GITHUB_OUTPUT"
+            echo "  manifests.${k} = ${v}"
           done
 
       # A tag that disagrees with versions.yaml would publish an image whose
@@ -46,6 +53,7 @@ jobs:
           esac
 
       - name: fetch our u-boot and verify it
+        id: uboot
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ steps.v.outputs.uboot_repo }}
@@ -64,10 +72,55 @@ jobs:
           ver="$(strings uboot/u-boot.bin | grep -m1 'U-Boot 20' || true)"
           echo "  u-boot: ${ver:-<no version string>}"
           [ -n "$ver" ] || exit 1
+          echo "sha256=$(sha256sum uboot/u-boot.bin | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      # Extension tags are re-pointed as siderolabs rebuild them for newer
+      # Talos releases: the tailscale extension's bare tag resolved to a
+      # DIFFERENT digest on 2026-09-29 than the one Talos v1.14.0's own
+      # manifest names for it. Pinning "whatever the tag resolves to today"
+      # would silently pin a build made for a different Talos, so the pins
+      # in versions.yaml are checked against Talos's own release manifests --
+      # the only authority for "what belongs with this Talos version".
+      - name: extension and overlay pins match Talos's own manifests
+        env:
+          OVERLAY: ${{ steps.v.outputs.overlay }}
+          TAILSCALE: ${{ steps.v.outputs.tailscale }}
+          EXT_MANIFEST: ${{ steps.v.outputs.manifest_extensions }}
+          OVERLAY_MANIFEST: ${{ steps.v.outputs.manifest_overlays }}
+        run: |
+          go install github.com/google/go-containerregistry/cmd/crane@latest
+          gopath="$(go env GOPATH)"
+          echo "$gopath/bin" >> "$GITHUB_PATH"
+          export PATH="$PATH:$gopath/bin"
+
+          digests=$(crane export "$EXT_MANIFEST" - | tar -xO image-digests)
+          if grep -qxF "$TAILSCALE" <<<"$digests"; then
+            echo "ok: $TAILSCALE matches Talos's extensions manifest"
+          else
+            name=${TAILSCALE%%:*}
+            echo "tailscale extension $TAILSCALE is not in Talos's own manifest; it says:" >&2
+            grep -F "$name:" <<<"$digests" >&2 || echo "(no such extension)" >&2
+            exit 1
+          fi
+
+          overlays=$(crane export "$OVERLAY_MANIFEST" - | tar -xO overlays.yaml)
+          got=$(yq -r '.overlays[] | select(.name == "rpi_5") | .image + "@" + .digest' <<<"$overlays")
+          if [ "$got" = "$OVERLAY" ]; then
+            echo "ok: $OVERLAY matches Talos's overlays manifest"
+          else
+            echo "pi5 overlay is $OVERLAY, Talos's own overlays manifest says ${got:-(none)}" >&2
+            exit 1
+          fi
+
+      # The overlay installer binary we run below (to populate the SD
+      # image's ESP) is arm64; the runner is amd64.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: build the installer with the Talos imager
         env:
-          TALOS: ${{ steps.v.outputs.talos }}
+          IMAGER: ${{ steps.v.outputs.imager }}
           OVERLAY: ${{ steps.v.outputs.overlay }}
           TAILSCALE: ${{ steps.v.outputs.tailscale }}
         run: |
@@ -76,7 +129,7 @@ jobs:
             -v "$PWD/out:/out" \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --privileged \
-            "ghcr.io/siderolabs/imager:${TALOS}" installer \
+            "${IMAGER}" installer \
               --arch arm64 \
               --overlay-name rpi_5 \
               --overlay-image "${OVERLAY}" \
@@ -102,10 +155,7 @@ jobs:
             TAG="ci-${GITHUB_SHA::12}"
           fi
 
-          go install github.com/google/go-containerregistry/cmd/crane@latest
-          export PATH="$PATH:$(go env GOPATH)/bin"
-
-          ART="$(ls out/installer-*.tar | head -1)"
+          ART="$(find out -maxdepth 1 -name 'installer-*.tar' | head -1)"
           echo "  imager artifact: $ART"
           crane push "$ART" "${IMAGE}:${TAG}-base"
 
@@ -117,33 +167,165 @@ jobs:
           tar cf uboot-layer.tar -C layer --owner=0 --group=0 .
 
           crane append -b "${IMAGE}:${TAG}-base" -f uboot-layer.tar -t "${IMAGE}:${TAG}"
-          echo "image=${IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
+          digest="$(crane digest "${IMAGE}:${TAG}")"
+          {
+            echo "image=${IMAGE}:${TAG}"
+            echo "digest=${digest}"
+            echo "image_by_digest=${IMAGE}@${digest}"
+          } >> "$GITHUB_OUTPUT"
 
       # Publishing an installer that does not contain our u-boot would be
       # worse than publishing nothing: it looks correct and reverts pi5's
-      # firmware on the next upgrade. Pull the pushed image back and check.
+      # firmware on the next upgrade. Pull the pushed image back BY DIGEST --
+      # the exact reference a node is pointed at (see the README's note on
+      # why the tag can't be part of that reference) -- and check.
       - name: verify the published image really carries our u-boot
         env:
-          IMAGE: ${{ steps.push.outputs.image }}
+          IMAGE_BY_DIGEST: ${{ steps.push.outputs.image_by_digest }}
           UBOOT_PATH: ${{ steps.v.outputs.uboot_path }}
         run: |
-          export PATH="$PATH:$(go env GOPATH)/bin"
-          crane export "$IMAGE" - | tar -xO "$UBOOT_PATH" > pulled-u-boot.bin
+          crane export "$IMAGE_BY_DIGEST" - | tar -xO "$UBOOT_PATH" > pulled-u-boot.bin
           a="$(sha256sum uboot/u-boot.bin | awk '{print $1}')"
           b="$(sha256sum pulled-u-boot.bin | awk '{print $1}')"
           echo "  built:     $a"
           echo "  published: $b"
           [ "$a" = "$b" ] || { echo "published image does NOT carry our u-boot" >&2; exit 1; }
-          echo "  ok: published installer carries the EFI-capable u-boot"
+          echo "  ok: published installer ($IMAGE_BY_DIGEST) carries the EFI-capable u-boot"
+
+      # THE SD IMAGE NEEDS ONE MORE STEP THAN YOU WOULD EXPECT. Measured
+      # 2026-09-29 with the pinned imager: the `metal` output for rpi_5 is
+      # NOT bootable. The imager never runs the overlay installer in image
+      # mode, so the ESP holds EFI/ and loader/ and nothing else -- no
+      # config.txt, no u-boot.bin, no device trees. The Pi's firmware reads
+      # config.txt from the FAT root and finds nothing.
+      #
+      # So this step runs the overlay installer THE IMAGER SKIPPED, using
+      # the real binary from the installer image we just published (pulled
+      # by digest, same as above), exactly as a node's own install invokes
+      # it, into a staging directory that is then copied onto the disk
+      # image's ESP. That makes the SD image and the installer carry the
+      # same u-boot, config.txt and DTBs by construction, and the result is
+      # asserted byte-for-byte rather than assumed.
+      - name: build the flashable SD image
+        env:
+          IMAGER: ${{ steps.v.outputs.imager }}
+          OVERLAY: ${{ steps.v.outputs.overlay }}
+          IMAGE_BY_DIGEST: ${{ steps.push.outputs.image_by_digest }}
+        run: |
+          mkdir -p out-metal esp-stage/boot/EFI
+          docker run --rm --privileged -v "$PWD/out-metal:/out" -v /dev:/dev "$IMAGER" metal \
+            --arch arm64 --overlay-name rpi_5 --overlay-image "$OVERLAY"
+          raw_zst=$(find out-metal -maxdepth 1 -name 'metal-arm64.raw.zst')
+          [ -n "$raw_zst" ] || { echo "imager produced no metal-arm64.raw.zst" >&2; exit 1; }
+
+          extra_options=$(crane export "$IMAGE_BY_DIGEST" - | tar -xO overlay/extra-options 2>/dev/null || echo "{}")
+          docker run --rm -i --platform linux/arm64 \
+            -v "$PWD/esp-stage:/stage" \
+            --entrypoint /overlay/installers/default \
+            "$IMAGE_BY_DIGEST" install <<EOF
+          installDisk: /dev/null
+          mountPrefix: /stage
+          artifactsPath: /overlay/artifacts
+          extraOptions: ${extra_options}
+          EOF
+
+          [ -f esp-stage/boot/EFI/config.txt ] || { echo "overlay installer wrote no config.txt" >&2; exit 1; }
+          cmp -s esp-stage/boot/EFI/u-boot.bin uboot/u-boot.bin || { echo "overlay installer staged a u-boot that is not ours" >&2; exit 1; }
+          echo "  staged: $(find esp-stage/boot/EFI -maxdepth 1 -type f | wc -l) files at the ESP root"
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends mtools fdisk zstd
+          zstd -dqf out-metal/metal-arm64.raw.zst -o out-metal/metal.raw
+
+          # Partition 1 must be the ESP; find it by type, not by position.
+          esp=$(sudo sfdisk -J out-metal/metal.raw | jq -r '.partitiontable.partitions[0] | select(.type == "C12A7328-F81F-11D2-BA4B-00A0C93EC93B") | .start')
+          [ -n "$esp" ] || { echo "partition 1 of the image is not an EFI System Partition" >&2; exit 1; }
+          img="out-metal/metal.raw@@$((esp * 512))"
+
+          mcopy -s -o -m -i "$img" esp-stage/boot/EFI/* ::/
+          # Read back what is ON THE IMAGE, not what we meant to put there.
+          mcopy -o -i "$img" ::/u-boot.bin out-metal/readback-u-boot.bin
+          mcopy -o -i "$img" ::/config.txt out-metal/readback-config.txt
+          cmp esp-stage/boot/EFI/u-boot.bin out-metal/readback-u-boot.bin
+          cmp esp-stage/boot/EFI/config.txt out-metal/readback-config.txt
+          cmp uboot/u-boot.bin out-metal/readback-u-boot.bin || { echo "the SD image ESP does not carry our u-boot" >&2; exit 1; }
+          echo "  ok: the SD image ESP carries our u-boot and config.txt, verified by reading them back"
+
+          zstd -T0 -12 -qf out-metal/metal.raw -o metal-arm64.raw.zst
+
+      - name: write provenance and assemble release artifacts
+        env:
+          TAG: ${{ steps.v.outputs.talos }}
+          TALOS: ${{ steps.v.outputs.talos }}
+          IMAGE: ${{ steps.push.outputs.image }}
+          IMAGE_BY_DIGEST: ${{ steps.push.outputs.image_by_digest }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          UBOOT_REPO: ${{ steps.v.outputs.uboot_repo }}
+          UBOOT_TAG: ${{ steps.v.outputs.uboot_tag }}
+          UBOOT_SHA256: ${{ steps.uboot.outputs.sha256 }}
+        run: |
+          mkdir -p artifacts
+          cp metal-arm64.raw.zst artifacts/
+          echo "$DIGEST" > artifacts/installer.digest
+
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          jq -n \
+            --arg talos "$TALOS" \
+            --arg installer "$IMAGE_BY_DIGEST" \
+            --arg installer_tag "$IMAGE" \
+            --arg source_commit "$GITHUB_SHA" \
+            --arg uboot_repo "$UBOOT_REPO" --arg uboot_tag "$UBOOT_TAG" --arg uboot_sha256 "$UBOOT_SHA256" \
+            --arg built_by "$run" \
+            '{talos: $talos, installer: $installer, installer_tag: $installer_tag,
+              source_commit: $source_commit,
+              uboot: {repo: $uboot_repo, tag: $uboot_tag, sha256: $uboot_sha256},
+              built_by: $built_by}' \
+            > artifacts/provenance.json
+          cat artifacts/provenance.json
+
+          ( cd artifacts && sha256sum metal-arm64.raw.zst installer.digest provenance.json > SHA256SUMS )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pi5-installer-${{ github.sha }}
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          body: |
+            pi5 Talos installer and flashable SD image, with our EFI-capable
+            u-boot (`${{ steps.v.outputs.uboot_repo }}` `${{ steps.v.outputs.uboot_tag }}`)
+            laid over the `rpi_5` overlay.
+
+            Consume the installer **by digest**, never `repo:tag@sha256:`:
+            Talos v1.14 drops the tag when it stores that form, and
+            `talosctl upgrade` then cannot find the image it just pulled.
+            See the README for the full explanation.
+
+            ```
+            ${{ steps.push.outputs.image_by_digest }}
+            ```
+
+            Verify with `sha256sum -c SHA256SUMS`.
 
       - name: summary
         env:
           IMAGE: ${{ steps.push.outputs.image }}
+          IMAGE_BY_DIGEST: ${{ steps.push.outputs.image_by_digest }}
         run: |
           {
             echo "### published"
             echo
+            echo "Point nodes at the digest, never \`repo:tag@sha256\`:"
+            echo
             echo '```'
-            echo "$IMAGE"
+            echo "$IMAGE_BY_DIGEST"
             echo '```'
+            echo
+            echo "(tagged as \`$IMAGE\`)"
           } >> "$GITHUB_STEP_SUMMARY"
